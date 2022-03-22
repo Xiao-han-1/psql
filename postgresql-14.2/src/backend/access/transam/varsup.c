@@ -51,7 +51,7 @@ GetNewTransactionId(bool isSubXact)
 {
 	FullTransactionId full_xid;
 	TransactionId xid;
-
+    int spin_lock=5;
 	/*
 	 * Workers synchronize transaction state at the beginning of each parallel
 	 * operation, so we can't account for new XIDs after that point.
@@ -75,7 +75,7 @@ GetNewTransactionId(bool isSubXact)
 	if (RecoveryInProgress())
 		elog(ERROR, "cannot assign TransactionIds during recovery");
 
-	LWLockAcquire(XidGenLock, LW_EXCLUSIVE);
+	MyLWLockAcquire(XidGenLock, LW_EXCLUSIVE,spin_lock);
 
 	full_xid = ShmemVariableCache->nextXid;
 	xid = XidFromFullTransactionId(full_xid);
@@ -116,7 +116,7 @@ GetNewTransactionId(bool isSubXact)
 		 */
 		if (IsUnderPostmaster && (xid % 65536) == 0)
 			SendPostmasterSignal(PMSIGNAL_START_AUTOVAC_LAUNCHER);
-        
+
 		if (IsUnderPostmaster &&
 			TransactionIdFollowsOrEquals(xid, xidStopLimit))
 		{

@@ -1363,6 +1363,178 @@ LWLockAcquire(LWLock *lock, LWLockMode mode)
 	return result;
 }
 
+bool
+MyLWLockAcquire(LWLock *lock, LWLockMode mode, int spin_lock)
+{
+	PGPROC	   *proc = MyProc;
+	bool		result = true;
+	int			extraWaits = 0;
+#ifdef LWLOCK_STATS
+	lwlock_stats *lwstats;
+
+	lwstats = get_lwlock_stats_entry(lock);
+#endif
+
+	AssertArg(mode == LW_SHARED || mode == LW_EXCLUSIVE);
+
+	PRINT_LWDEBUG("LWLockAcquire", lock, mode);
+
+#ifdef LWLOCK_STATS
+	/* Count lock acquisition attempts */
+	if (mode == LW_EXCLUSIVE)
+		lwstats->ex_acquire_count++;
+	else
+		lwstats->sh_acquire_count++;
+#endif							/* LWLOCK_STATS */
+
+	/*
+	 * We can't wait if we haven't got a PGPROC.  This should only occur
+	 * during bootstrap or shared memory initialization.  Put an Assert here
+	 * to catch unsafe coding practices.
+	 */
+	Assert(!(proc == NULL && IsUnderPostmaster));
+
+	/* Ensure we will have room to remember the lock */
+	if (num_held_lwlocks >= MAX_SIMUL_LWLOCKS)
+		elog(ERROR, "too many LWLocks taken");
+
+	/*
+	 * Lock out cancel/die interrupts until we exit the code section protected
+	 * by the LWLock.  This ensures that interrupts will not interfere with
+	 * manipulations of data structures in shared memory.
+	 */
+	HOLD_INTERRUPTS();
+
+	/*
+	 * Loop here to try to acquire lock after each time we are signaled by
+	 * LWLockRelease.
+	 *
+	 * NOTE: it might seem better to have LWLockRelease actually grant us the
+	 * lock, rather than retrying and possibly having to go back to sleep. But
+	 * in practice that is no good because it means a process swap for every
+	 * lock acquisition when two or more processes are contending for the same
+	 * lock.  Since LWLocks are normally used to protect not-very-long
+	 * sections of computation, a process needs to be able to acquire and
+	 * release the same lock many times during a single CPU time slice, even
+	 * in the presence of contention.  The efficiency of being able to do that
+	 * outweighs the inefficiency of sometimes wasting a process dispatch
+	 * cycle because the lock is not free when a released waiter finally gets
+	 * to run.  See pgsql-hackers archives for 29-Dec-01.
+	 */
+	for (;;)
+	{
+		bool		mustwait;
+
+		/*
+		 * Try to grab the lock the first time, we're not in the waitqueue
+		 * yet/anymore.
+		 */
+		mustwait = LWLockAttemptLock(lock, mode);
+
+		if (!mustwait)
+		{
+			LOG_LWDEBUG("LWLockAcquire", lock, "immediately acquired lock");
+			break;				/* got the lock */
+		}
+
+		/*
+		 * Ok, at this point we couldn't grab the lock on the first try. We
+		 * cannot simply queue ourselves to the end of the list and wait to be
+		 * woken up because by now the lock could long have been released.
+		 * Instead add us to the queue and try to grab the lock again. If we
+		 * succeed we need to revert the queuing and be happy, otherwise we
+		 * recheck the lock. If we still couldn't grab it, we know that the
+		 * other locker will see our queue entries when releasing since they
+		 * existed before we checked for the lock.
+		 */
+
+		/* add to the queue */
+		LWLockQueueSelf(lock, mode);
+
+		/* we're now guaranteed to be woken up if necessary */
+		for (size_t i = 0; i < spin_lock; i++)
+		{
+
+		mustwait = LWLockAttemptLock(lock, mode);
+		if (!mustwait)
+		{
+			break;				/* got the lock */
+		}
+			/* code */
+		}
+
+		/* ok, grabbed the lock the second time round, need to undo queueing */
+		if (!mustwait)
+		{
+			LOG_LWDEBUG("LWLockAcquire", lock, "acquired, undoing queue");
+
+			LWLockDequeueSelf(lock);
+			break;
+		}
+
+		/*
+		 * Wait until awakened.
+		 *
+		 * It is possible that we get awakened for a reason other than being
+		 * signaled by LWLockRelease.  If so, loop back and wait again.  Once
+		 * we've gotten the LWLock, re-increment the sema by the number of
+		 * additional signals received.
+		 */
+		LOG_LWDEBUG("LWLockAcquire", lock, "waiting");
+
+#ifdef LWLOCK_STATS
+		lwstats->block_count++;
+#endif
+
+		LWLockReportWaitStart(lock);
+		if (TRACE_POSTGRESQL_LWLOCK_WAIT_START_ENABLED())
+			TRACE_POSTGRESQL_LWLOCK_WAIT_START(T_NAME(lock), mode);
+
+		for (;;)
+		{
+			PGSemaphoreLock(proc->sem);
+			if (!proc->lwWaiting)
+				break;
+			extraWaits++;
+		}
+
+		/* Retrying, allow LWLockRelease to release waiters again. */
+		pg_atomic_fetch_or_u32(&lock->state, LW_FLAG_RELEASE_OK);
+
+#ifdef LOCK_DEBUG
+		{
+			/* not waiting anymore */
+			uint32		nwaiters PG_USED_FOR_ASSERTS_ONLY = pg_atomic_fetch_sub_u32(&lock->nwaiters, 1);
+
+			Assert(nwaiters < MAX_BACKENDS);
+		}
+#endif
+
+		if (TRACE_POSTGRESQL_LWLOCK_WAIT_DONE_ENABLED())
+			TRACE_POSTGRESQL_LWLOCK_WAIT_DONE(T_NAME(lock), mode);
+		LWLockReportWaitEnd();
+
+		LOG_LWDEBUG("LWLockAcquire", lock, "awakened");
+
+		/* Now loop back and try to acquire lock again. */
+		result = false;
+	}
+
+	if (TRACE_POSTGRESQL_LWLOCK_ACQUIRE_ENABLED())
+		TRACE_POSTGRESQL_LWLOCK_ACQUIRE(T_NAME(lock), mode);
+
+	/* Add lock to list of locks held by this backend */
+	held_lwlocks[num_held_lwlocks].lock = lock;
+	held_lwlocks[num_held_lwlocks++].mode = mode;
+
+	/*
+	 * Fix the process wait semaphore's count for any absorbed wakeups.
+	 */
+	while (extraWaits-- > 0)
+		PGSemaphoreUnlock(proc->sem);
+
+	return result;
+}
 /*
  * LWLockConditionalAcquire - acquire a lightweight lock in the specified mode
  *
